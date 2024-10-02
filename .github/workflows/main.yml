@@ -127,8 +127,6 @@ jobs:
           id: sanitizer-memory
           os: ubuntu-latest
           setup-script: sanitizer
-          container:
-            name: noble
           env:
             CC: clang
             CFLAGS: -fsanitize=memory -fsanitize-memory-track-origins=2 -fsanitize-blacklist=/home/libgit2/source/script/sanitizers.supp -fno-optimize-sibling-calls -fno-omit-frame-pointer
