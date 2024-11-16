@@ -48,7 +48,7 @@
  */
 struct hashmap {
 	int nr, alloc;
-	struct entry {
+	struct xdiff_entry {
 		unsigned long hash;
 		/*
 		 * 0 = unused entry, 1 = first line, 2 = second, etc.
@@ -61,7 +61,7 @@ struct hashmap {
 		 * sequence;
 		 * initially, "next" reflects only the order in file1.
 		 */
-		struct entry *next, *previous;
+		struct xdiff_entry *next, *previous;
 
 		/*
 		 * If 1, this entry can serve as an anchor. See
@@ -157,11 +157,11 @@ static int fill_hashmap(mmfile_t *file1, mmfile_t *file2,
 
 	/* We know exactly how large we want the hash map */
 	result->alloc = count1 * 2;
-	result->entries = (struct entry *)
-		xdl_malloc(result->alloc * sizeof(struct entry));
+	result->entries = (struct xdiff_entry *)
+		xdl_malloc(result->alloc * sizeof(struct xdiff_entry));
 	if (!result->entries)
 		return -1;
-	memset(result->entries, 0, result->alloc * sizeof(struct entry));
+	memset(result->entries, 0, result->alloc * sizeof(struct xdiff_entry));
 
 	/* First, fill with entries from the first file */
 	while (count1--)
@@ -178,8 +178,8 @@ static int fill_hashmap(mmfile_t *file1, mmfile_t *file2,
  * Find the longest sequence with a smaller last element (meaning a smaller
  * line2, as we construct the sequence with entries ordered by line1).
  */
-static int binary_search(struct entry **sequence, int longest,
-		struct entry *entry)
+static int binary_search(struct xdiff_entry **sequence, int longest,
+		struct xdiff_entry *entry)
 {
 	int left = -1, right = longest;
 
@@ -204,11 +204,11 @@ static int binary_search(struct entry **sequence, int longest,
  * item per sequence length: the sequence with the smallest last
  * element (in terms of line2).
  */
-static struct entry *find_longest_common_sequence(struct hashmap *map)
+static struct xdiff_entry *find_longest_common_sequence(struct hashmap *map)
 {
-	struct entry **sequence = xdl_malloc(map->nr * sizeof(struct entry *));
+	struct xdiff_entry **sequence = xdl_malloc(map->nr * sizeof(struct xdiff_entry *));
 	int longest = 0, i;
-	struct entry *entry;
+	struct xdiff_entry *entry;
 
 	/*
 	 * If not -1, this entry in sequence must never be overridden.
@@ -266,7 +266,7 @@ static int patience_diff(mmfile_t *file1, mmfile_t *file2,
 		xpparam_t const *xpp, xdfenv_t *env,
 		int line1, int count1, int line2, int count2);
 
-static int walk_common_sequence(struct hashmap *map, struct entry *first,
+static int walk_common_sequence(struct hashmap *map, struct xdiff_entry *first,
 		int line1, int count1, int line2, int count2)
 {
 	int end1 = line1 + count1, end2 = line2 + count2;
