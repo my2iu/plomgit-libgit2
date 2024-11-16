@@ -21,6 +21,7 @@
 #include "streams/socket.h"
 #include "streams/tls.h"
 #include "auth.h"
+#include "android_jni.h"
 
 static git_http_auth_scheme auth_schemes[] = {
 	{ GIT_HTTP_AUTH_NEGOTIATE, "Negotiate", GIT_CREDENTIAL_DEFAULT, git_http_auth_negotiate },
@@ -102,6 +103,8 @@ typedef struct {
 
 /* HTTP client connection */
 struct git_http_client {
+	jobject jHttpClient;
+
 	git_http_client_options opts;
 
 	/* Are we writing to the proxy or server, and state of the client. */
@@ -687,6 +690,7 @@ static bool use_connect_proxy(git_http_client *client)
 }
 
 static int generate_request(
+	JNIEnv *env,
 	git_http_client *client,
 	git_http_request *request)
 {
@@ -697,6 +701,12 @@ static int generate_request(
 	GIT_ASSERT_ARG(client);
 	GIT_ASSERT_ARG(request);
 
+	jmethodID setRequestPropertyMethodId;
+	jmethodID setCredentialsMethodId;
+
+	setRequestPropertyMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V");
+
+#if 0
 	git_buf_clear(&client->request_msg);
 	buf = &client->request_msg;
 
@@ -718,19 +728,37 @@ static int generate_request(
 	git_buf_puts(buf, "Host: ");
 	puts_host_and_port(buf, request->url, false);
 	git_buf_puts(buf, "\r\n");
+#endif
 
-	if (request->accept)
-		git_buf_printf(buf, "Accept: %s\r\n", request->accept);
-	else
-		git_buf_puts(buf, "Accept: */*\r\n");
+	if (request->accept) {
+		(*env)->CallVoidMethod(env, client->jHttpClient, setRequestPropertyMethodId,
+			(*env)->NewStringUTF(env, "Accept"),
+			(*env)->NewStringUTF(env, request->accept));
+		// git_buf_printf(buf, "Accept: %s\r\n", request->accept);
+	} else {
+		(*env)->CallVoidMethod(env, client->jHttpClient, setRequestPropertyMethodId,
+			(*env)->NewStringUTF(env, "Accept"),
+			(*env)->NewStringUTF(env, "*/*"));
+		// git_buf_puts(buf, "Accept: */*\r\n");
+	}
 
-	if (request->content_type)
-		git_buf_printf(buf, "Content-Type: %s\r\n",
-			request->content_type);
+	if (request->content_type) {
+		// git_buf_printf(buf, "Content-Type: %s\r\n",
+		// 	request->content_type);
+		(*env)->CallVoidMethod(env, client->jHttpClient, setRequestPropertyMethodId,
+			(*env)->NewStringUTF(env, "Content-Type"),
+			(*env)->NewStringUTF(env, request->content_type));
+	}
 
-	if (request->chunked)
-		git_buf_puts(buf, "Transfer-Encoding: chunked\r\n");
+	if (request->chunked) {
+		// git_buf_puts(buf, "Transfer-Encoding: chunked\r\n");
 
+		jmethodID setChunkedMethodId;
+		setChunkedMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "setChunked", "()V");
+		(*env)->CallVoidMethod(env, client->jHttpClient, setChunkedMethodId);
+	}
+
+#if 0
 	if (request->content_length > 0)
 		git_buf_printf(buf, "Content-Length: %"PRIuZ "\r\n",
 			request->content_length);
@@ -742,20 +770,33 @@ static int generate_request(
 	    (!use_connect_proxy(client) &&
 			(error = apply_proxy_credentials(buf, client, request)) < 0))
 		return error;
+#endif
+
+	setCredentialsMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "setCredentials", "(Ljava/lang/String;Ljava/lang/String;)V");
+	if (request->credentials && request->credentials->credtype == GIT_CREDENTIAL_USERPASS_PLAINTEXT) {
+		(*env)->CallVoidMethod(env, client->jHttpClient, setCredentialsMethodId, 
+			(*env)->NewStringUTF(env, ((struct git_credential_userpass_plaintext *)request->credentials)->username),
+			(*env)->NewStringUTF(env, ((struct git_credential_userpass_plaintext *)request->credentials)->password));
+	}
 
 	if (request->custom_headers) {
+		jmethodID setCustomRequestHeaderMethodId;
+		setCustomRequestHeaderMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "setCustomRequestHeader", "(Ljava/lang/String;)V");
 		for (i = 0; i < request->custom_headers->count; i++) {
 			const char *hdr = request->custom_headers->strings[i];
 
-			if (hdr)
-				git_buf_printf(buf, "%s\r\n", hdr);
+			if (hdr) {
+				// git_buf_printf(buf, "%s\r\n", hdr);
+				(*env)->CallVoidMethod(env, client->jHttpClient, setCustomRequestHeaderMethodId,
+					(*env)->NewStringUTF(env, hdr));
+			}
 		}
 	}
 
-	git_buf_puts(buf, "\r\n");
+	// git_buf_puts(buf, "\r\n");
 
-	if (git_buf_oom(buf))
-		return -1;
+	// if (git_buf_oom(buf))
+	// 	return -1;
 
 	return 0;
 }
@@ -1244,6 +1285,12 @@ int git_http_client_send_request(
 {
 	git_http_response response = {0};
 	int error = -1;
+	JNIEnv *env;
+	jstring methodTypeString;
+	jmethodID setMethodMethodId;
+	jmethodID makeUrlMethodId;
+	jmethodID setUrlMethodId;
+	jmethodID startRequestMethodId;
 
 	GIT_ASSERT_ARG(client);
 	GIT_ASSERT_ARG(request);
@@ -1265,13 +1312,62 @@ int git_http_client_send_request(
 		git_buf_dispose(&url);
 	}
 
-	if ((error = http_client_connect(client, request)) < 0 ||
-	    (error = generate_request(client, request)) < 0 ||
-	    (error = client_write_request(client)) < 0)
+	env = getJvmEnv();
+	methodTypeString = NULL;
+	if (request->method == GIT_HTTP_METHOD_GET)
+		methodTypeString = (*env)->NewStringUTF(env, "GET");
+	else if (request->method == GIT_HTTP_METHOD_POST)
+		methodTypeString = (*env)->NewStringUTF(env, "POST");
+	else if (request->method == GIT_HTTP_METHOD_CONNECT)
+		methodTypeString = (*env)->NewStringUTF(env, "CONNECT");
+	setMethodMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "setRequestMethod", "(Ljava/lang/String;)V");
+	(*env)->CallVoidMethod(env, client->jHttpClient, setMethodMethodId, methodTypeString);
+
+	makeUrlMethodId = (*env)->GetStaticMethodID(env, jGitHttpClientClass, "makeUrl", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Lcom/example/libgit2/GitUrl;");
+	jobject jUrl = (*env)->CallStaticObjectMethod(env, jGitHttpClientClass, makeUrlMethodId, 
+		(*env)->NewStringUTF(env, request->url->scheme),
+		(*env)->NewStringUTF(env, request->url->host),
+		(*env)->NewStringUTF(env, request->url->port),
+		(*env)->NewStringUTF(env, request->url->path),
+		(*env)->NewStringUTF(env, request->url->query),
+		(*env)->NewStringUTF(env, request->url->username),
+		(*env)->NewStringUTF(env, request->url->password)
+	);
+
+	setUrlMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "setRequestUrl", "(Lcom/example/libgit2/GitUrl;)V");
+	(*env)->CallVoidMethod(env, client->jHttpClient, setUrlMethodId, jUrl);
+
+	// Unhandled 
+	// git_net_url *proxy;                /**< Proxy to use */
+
+	// /* Headers */
+	// const char *accept;                /**< Contents of the Accept header */
+	// const char *content_type;          /**< Content-Type header (for POST) */
+	// git_credential *credentials;       /**< Credentials to authenticate with */
+	// git_credential *proxy_credentials; /**< Credentials for proxy */
+	// git_strarray *custom_headers;      /**< Additional headers to deliver */
+
+	// /* To POST a payload, either set content_length OR set chunked. */
+	// size_t content_length;             /**< Length of the POST body */
+	// unsigned chunked : 1,              /**< Post with chunking */
+	//          expect_continue : 1;      /**< Use expec*/
+
+	startRequestMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "startRequest", "()I");
+	if ((error = (int)((*env)->CallIntMethod(env, client->jHttpClient, startRequestMethodId))) < 0)
 		goto done;
+
+
+	if (
+		//(error = http_client_connect(client, request)) < 0 ||
+	     (error = generate_request(env, client, request)) < 0 //||
+	//     (error = client_write_request(client)) < 0
+	)
+	 	goto done;
+
 
 	client->state = SENT_REQUEST;
 
+#if 0
 	if (request->expect_continue) {
 		if ((error = git_http_client_read_response(&response, client)) < 0 ||
 		    (error = git_http_client_skip_body(client)) < 0)
@@ -1284,6 +1380,7 @@ int git_http_client_send_request(
 			goto done;
 		}
 	}
+#endif	
 
 	if (request->content_length || request->chunked) {
 		client->state = SENDING_BODY;
@@ -1292,12 +1389,13 @@ int git_http_client_send_request(
 		client->request_chunked = request->chunked;
 	}
 
-	reset_parser(client);
+	// reset_parser(client);
 
 done:
 	if (error == GIT_RETRY)
 		error = 0;
 
+	releaseJvmEnv();
 	git_http_response_dispose(&response);
 	return error;
 }
@@ -1307,6 +1405,30 @@ bool git_http_client_has_response(git_http_client *client)
 	return (client->state == HAS_EARLY_RESPONSE ||
 	        client->state > SENT_REQUEST);
 }
+
+static int send_bytes(
+	git_http_client *client,
+	const char *buffer,
+	size_t buffer_len)
+{
+	JNIEnv *env;
+	jmethodID writeBytesMethodId;
+	jobject jBytes;
+	jbyte * jBytesRaw;
+	int error;
+
+	env = getJvmEnv();
+	writeBytesMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "writeBytes", "([B)I");
+	jBytes = (*env)->NewByteArray(env, buffer_len);
+	jBytesRaw = (*env)->GetByteArrayElements(env, jBytes, NULL);
+	memcpy(jBytesRaw, buffer, buffer_len);
+	(*env)->ReleaseByteArrayElements(env, jBytes, jBytesRaw, 0);
+	error = (*env)->CallIntMethod(env, client->jHttpClient, writeBytesMethodId, jBytes);
+done:
+	releaseJvmEnv();
+	return error;
+}
+
 
 int git_http_client_send_body(
 	git_http_client *client,
@@ -1336,15 +1458,17 @@ int git_http_client_send_body(
 	if (client->request_body_len) {
 		GIT_ASSERT(buffer_len <= client->request_body_remain);
 
-		if ((error = stream_write(server, buffer, buffer_len)) < 0)
+		if ((error = send_bytes(client, buffer, buffer_len)) < 0)
 			goto done;
 
 		client->request_body_remain -= buffer_len;
 	} else {
-		if ((error = git_buf_printf(&hdr, "%" PRIxZ "\r\n", buffer_len)) < 0 ||
-		    (error = stream_write(server, hdr.ptr, hdr.size)) < 0 ||
-		    (error = stream_write(server, buffer, buffer_len)) < 0 ||
-		    (error = stream_write(server, "\r\n", 2)) < 0)
+		if (
+			// (error = git_buf_printf(&hdr, "%" PRIxZ "\r\n", buffer_len)) < 0 ||
+		    // (error = send_bytes(client, hdr.ptr, hdr.size)) < 0 ||
+		    (error = send_bytes(client, buffer, buffer_len)) < 0 //||
+		    // (error = send_bytes(client, "\r\n", 2)) < 0
+			)
 			goto done;
 	}
 
@@ -1353,7 +1477,7 @@ done:
 	return error;
 }
 
-static int complete_request(git_http_client *client)
+static int complete_request(JNIEnv * env, git_http_client *client)
 {
 	int error = 0;
 
@@ -1364,7 +1488,21 @@ static int complete_request(git_http_client *client)
 		git_error_set(GIT_ERROR_HTTP, "truncated write");
 		error = -1;
 	} else if (client->request_chunked) {
-		error = stream_write(&client->server, "0\r\n\r\n", 5);
+		// jmethodID writeBytesMethodId;
+		// jobject jBytes;
+		// jbyte * jBytesRaw;
+		// int error;
+		// int buffer_len = 5;
+		// char * buffer = "0\r\n\r\n";
+		// writeBytesMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "writeBytes", "([B)I");
+		// jBytes = (*env)->NewByteArray(env, buffer_len);
+		// jBytesRaw = (*env)->GetByteArrayElements(env, jBytes, NULL);
+		// memcpy(jBytesRaw, buffer, buffer_len);
+		// (*env)->ReleaseByteArrayElements(env, jBytes, jBytesRaw, 0);
+		// error = (*env)->CallIntMethod(env, client->jHttpClient, writeBytesMethodId, jBytes);
+
+
+		// error = stream_write(&client->server, "0\r\n\r\n", 5);
 	}
 
 	client->state = SENT_REQUEST;
@@ -1376,13 +1514,21 @@ int git_http_client_read_response(
 	git_http_client *client)
 {
 	http_parser_context parser_context = {0};
+	JNIEnv * env;
 	int error;
+	int fieldIdx;
+	jmethodID startReadResponseMethodId;
+	jmethodID getHeaderFieldKeyMethodId;
+	jmethodID getHeaderFieldMethodId;
+	jmethodID getResponseCodeMethodId;
 
 	GIT_ASSERT_ARG(response);
 	GIT_ASSERT_ARG(client);
 
+	env = getJvmEnv();
+
 	if (client->state == SENDING_BODY) {
-		if ((error = complete_request(client)) < 0)
+		if ((error = complete_request(env, client)) < 0)
 			goto done;
 	}
 
@@ -1414,16 +1560,108 @@ int git_http_client_read_response(
 	parser_context.client = client;
 	parser_context.response = response;
 
-	while (client->state == READING_RESPONSE) {
-		if ((error = client_read_and_parse(client)) < 0)
-			goto done;
-	}
+	startReadResponseMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "startReadResponse", "()I");
+	getHeaderFieldKeyMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "getHeaderFieldKey", "(I)Ljava/lang/String;");
+	getHeaderFieldMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "getHeaderField", "(I)Ljava/lang/String;");
+	error = (*env)->CallIntMethod(env, client->jHttpClient, startReadResponseMethodId);
+	if (error < 0)
+		goto done;
+	for (fieldIdx = 0;; fieldIdx++)
+	{
+		jstring key;
+		jstring val;
+		const char *keystr;
+		const char *valstr;
+		key = (*env)->CallObjectMethod(env, client->jHttpClient, getHeaderFieldKeyMethodId, fieldIdx);
+		if (key == NULL)
+			break;
+		val = (*env)->CallObjectMethod(env, client->jHttpClient, getHeaderFieldMethodId, fieldIdx);
 
-	GIT_ASSERT(client->state == READING_BODY || client->state == DONE);
+		keystr = (*env)->GetStringUTFChars(env, key, NULL);
+		valstr = (*env)->GetStringUTFChars(env, val, NULL);
+
+		// TODO: Finish supporting all the headers from on_header_complete()
+		// TODO: Fix the error handling
+		if (!strcasecmp("Content-Type", keystr)) {
+			response->content_type =
+				git__strndup(valstr, strlen(valstr));
+			GIT_ERROR_CHECK_ALLOC(response->content_type);
+		} else if (!strcasecmp("Content-Length", keystr)) {
+			int64_t len;
+
+			if (git__strntol64(&len, valstr, strlen(valstr),
+							NULL, 10) < 0 || len < 0) {
+				git_error_set(GIT_ERROR_HTTP,
+							"invalid content-length");
+				return -1;
+			}
+
+			response->content_length = (size_t)len;
+		} else if (!strcasecmp("Transfer-Encoding", keystr) &&
+				!strcasecmp("chunked", valstr)) {
+				response->chunked = 1;
+		} else if (!strcasecmp("Proxy-Authenticate", keystr)) {
+			char *dup = git__strndup(valstr, strlen(valstr));
+			GIT_ERROR_CHECK_ALLOC(dup);
+
+			if (git_vector_insert(&client->proxy.auth_challenges, dup) < 0)
+				return -1;
+		} else if (!strcasecmp("WWW-Authenticate", keystr)) {
+			char *dup = git__strndup(valstr, strlen(valstr));
+			GIT_ERROR_CHECK_ALLOC(dup);
+
+			if (git_vector_insert(&client->server.auth_challenges, dup) < 0)
+				return -1;
+		} 
+		// else if (!strcasecmp("Location", keystr)) {
+		// 	if (response->location) {
+		// 		git_error_set(GIT_ERROR_HTTP,
+		// 			"multiple location headers");
+		// 		return -1;
+		// 	}
+
+		// 	response->location = git__strndup(value->ptr, value->size);
+		// 	GIT_ERROR_CHECK_ALLOC(response->location);
+		// }
+
+   		(*env)->ReleaseStringUTFChars(env, key, keystr);  
+   		(*env)->ReleaseStringUTFChars(env, val, valstr);  
+    }
+
+	// TODO: Add support for on_headers_complete()
+	getResponseCodeMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "getResponseCode", "()I");
+	response->status = (*env)->CallIntMethod(env, client->jHttpClient, getResponseCodeMethodId);
+	// client->keepalive = http_should_keep_alive(parser);
+
+	/* Prepare for authentication */
+	collect_authinfo(&response->server_auth_schemetypes,
+	                 &response->server_auth_credtypes,
+	                 &client->server.auth_challenges);
+	collect_authinfo(&response->proxy_auth_schemetypes,
+	                 &response->proxy_auth_credtypes,
+	                 &client->proxy.auth_challenges);
+
+	response->resend_credentials = resend_needed(client, response);
+
+
+	if (response->content_type || response->chunked)
+		client->state = READING_BODY;
+	else
+		client->state = DONE;
+
+
+	// while (client->state == READING_RESPONSE) {
+	// 	if ((error = client_read_and_parse(client)) < 0)
+	// 		goto done;
+	// }
+
+	assert(client->state == READING_BODY || client->state == DONE);
+
 
 done:
 	git_buf_dispose(&parser_context.parse_header_name);
 	git_buf_dispose(&parser_context.parse_header_value);
+	releaseJvmEnv();
 
 	return error;
 }
@@ -1435,6 +1673,13 @@ int git_http_client_read_body(
 {
 	http_parser_context parser_context = {0};
 	int error = 0;
+	JNIEnv * env;
+	jmethodID readBodyMethodId;
+	jmethodID getReadBufferMethodId;
+	jmethodID isEofMethodId;
+	jbyteArray jBuffer;
+	jbyte * jBufferContents;
+	jboolean jBufferIsCopy;
 
 	if (client->state == DONE)
 		return 0;
@@ -1444,16 +1689,23 @@ int git_http_client_read_body(
 		return -1;
 	}
 
+	env = getJvmEnv();
+	readBodyMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "readBody", "(I)I");
+	getReadBufferMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "getReadBuffer", "()[B");
+	isEofMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "isEof", "()Z");
+	error = (*env)->CallIntMethod(env, client->jHttpClient, readBodyMethodId, buffer_size);
+
+
 	/*
 	 * Now we'll read from the socket and http_parser will pipeline the
 	 * data directly to the client.
 	 */
 
-	parser_context.client = client;
-	parser_context.output_buf = buffer;
-	parser_context.output_size = buffer_size;
+	// parser_context.client = client;
+	// parser_context.output_buf = buffer;
+	// parser_context.output_size = buffer_size;
 
-	client->parser.data = &parser_context;
+	// client->parser.data = &parser_context;
 
 	/*
 	 * Clients expect to get a non-zero amount of data from us,
@@ -1462,22 +1714,34 @@ int git_http_client_read_body(
 	 * may end up reading only some stream metadata (like chunk
 	 * information).
 	 */
-	while (!parser_context.output_written) {
-		error = client_read_and_parse(client);
+	// while (!parser_context.output_written) {
+	// 	error = client_read_and_parse(client);
 
-		if (error <= 0)
-			goto done;
+	if (error == 0)
+		client->state = DONE;
 
-		if (client->state == DONE)
-			break;
-	}
+	if (error <= 0)
+		goto done;
 
-	GIT_ASSERT(parser_context.output_written <= INT_MAX);
-	error = (int)parser_context.output_written;
+	jBuffer = (*env)->CallObjectMethod(env, client->jHttpClient, getReadBufferMethodId);
+	jBufferContents = (*env)->GetByteArrayElements(env, jBuffer, &jBufferIsCopy);
+	memcpy(buffer, jBufferContents, error);
+	(*env)->ReleaseByteArrayElements(env, jBuffer, jBufferContents, JNI_ABORT);
+
+	// if ((*env)->CallBooleanMethod(env, client->jHttpClient, isEofMethodId))
+	// 	client->state = DONE;
+
+		// if (client->state == DONE)
+		// 	break;
+	// }
+
+	// GIT_ASSERT(parser_context.output_written <= INT_MAX);
+	// error = (int)parser_context.output_written;
 
 done:
 	if (error < 0)
 		client->connected = 0;
+	releaseJvmEnv();
 
 	return error;
 }
@@ -1486,6 +1750,8 @@ int git_http_client_skip_body(git_http_client *client)
 {
 	http_parser_context parser_context = {0};
 	int error;
+	JNIEnv * env;
+	jmethodID skipBodyMethodId;
 
 	if (client->state == DONE)
 		return 0;
@@ -1495,20 +1761,29 @@ int git_http_client_skip_body(git_http_client *client)
 		return -1;
 	}
 
-	parser_context.client = client;
-	client->parser.data = &parser_context;
 
-	do {
-		error = client_read_and_parse(client);
+	env = getJvmEnv();
+	skipBodyMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "skipBody", "()V");
+	(*env)->CallVoidMethod(env, client->jHttpClient, skipBodyMethodId);
+	releaseJvmEnv();
 
-		if (parser_context.error != HPE_OK ||
-		    (parser_context.parse_status != PARSE_STATUS_OK &&
-		     parser_context.parse_status != PARSE_STATUS_NO_OUTPUT)) {
-			git_error_set(GIT_ERROR_HTTP,
-			              "unexpected data handled in callback");
-			error = -1;
-		}
-	} while (error >= 0 && client->state != DONE);
+	client->state = DONE;
+	error = 0;
+
+	// parser_context.client = client;
+	// client->parser.data = &parser_context;
+
+	// do {
+	// 	error = client_read_and_parse(client);
+
+	// 	if (parser_context.error != HPE_OK ||
+	// 	    (parser_context.parse_status != PARSE_STATUS_OK &&
+	// 	     parser_context.parse_status != PARSE_STATUS_NO_OUTPUT)) {
+	// 		git_error_set(GIT_ERROR_HTTP,
+	// 		              "unexpected data handled in callback");
+	// 		error = -1;
+	// 	}
+	// } while (error >= 0 && client->state != DONE);
 
 	if (error < 0)
 		client->connected = 0;
@@ -1525,6 +1800,9 @@ int git_http_client_new(
 	git_http_client_options *opts)
 {
 	git_http_client *client;
+	JNIEnv *env;
+	jmethodID makeMethodId;
+	jobject localHttpClient;
 
 	GIT_ASSERT_ARG(out);
 
@@ -1536,6 +1814,14 @@ int git_http_client_new(
 
 	if (opts)
 		memcpy(&client->opts, opts, sizeof(git_http_client_options));
+
+	// Create a Java http client and save a reference to it. Don't bother
+	// saving the client options since we won't use them
+	env = getJvmEnv();
+	makeMethodId = (*env)->GetStaticMethodID(env, jGitHttpClientClass, "make", "()Lcom/example/libgit2/GitHttpClient;");
+	localHttpClient = (*env)->CallStaticObjectMethod(env, jGitHttpClientClass, makeMethodId);
+	client->jHttpClient = (jobject)((*env)->NewGlobalRef(env, localHttpClient));
+	releaseJvmEnv();
 
 	*out = client;
 	return 0;
@@ -1557,6 +1843,13 @@ GIT_INLINE(void) http_server_close(git_http_server *server)
 
 static void http_client_close(git_http_client *client)
 {
+	JNIEnv *env;
+	jmethodID closeMethodId;
+	env = getJvmEnv();
+	closeMethodId = (*env)->GetMethodID(env, jGitHttpClientClass, "close", "()V");
+	(*env)->CallVoidMethod(env, client->jHttpClient, closeMethodId);
+	releaseJvmEnv();
+
 	http_server_close(&client->server);
 	http_server_close(&client->proxy);
 
@@ -1570,10 +1863,17 @@ static void http_client_close(git_http_client *client)
 
 void git_http_client_free(git_http_client *client)
 {
+	JNIEnv *env;
 	if (!client)
 		return;
 
 	http_client_close(client);
+
+	// Release references to Java objects
+	env = getJvmEnv();
+	(*env)->DeleteGlobalRef(env, client->jHttpClient);
+	releaseJvmEnv();
+
 	git_buf_dispose(&client->read_buf);
 	git__free(client);
 }
